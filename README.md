@@ -1,4 +1,4 @@
-# PQ-PSBT Hybrid Wallet — Test Report
+# PQ-PSBT Hybrid signing Wallet — Test Report
 
 **Hybrid Taproot + Post-Quantum Signing Wallet**
 *23/23 Tests Passing · 4 NIST PQC Algorithms · Full BIP-341 Compliance*
