@@ -192,19 +192,48 @@ class TaprootKey:
     """
     BIP-340 Schnorr key.
 
-    When *bitcoinlib* is available the key is fully functional (real
-    Schnorr sign/verify, real Bech32m address encoding).  Without it the
-    class still works for structural / integration tests using
-    deterministic mocks that never touch the network.
+    Operates in one of two mutually-exclusive modes:
+
+    **Real mode** (``bitcoinlib`` available, ``mock=False``)
+        Full BIP-340 Schnorr sign/verify and Bech32m address encoding.
+        Safe for on-chain use.
+
+    **Mock mode** (``bitcoinlib`` unavailable or ``mock=True``)
+        Deterministic HMAC-based signatures for structural / integration
+        tests only.  Will refuse to sign if ``allow_mock_signing`` is
+        ``False`` (the default for mainnet).
+
+    .. warning::
+
+       Mock Taproot keys **MUST NEVER** be used for on-chain transactions.
+       They produce invalid curve points and non-BIP-340 signatures.
     """
 
-    def __init__(self, seed: Optional[bytes] = None) -> None:
-        if _HAS_BITCOINLIB:
-            self._key = BitcoinLibKey(seed) if seed else BitcoinLibKey()
-            self._mock_sk: Optional[bytes] = None
-        else:
+    def __init__(
+        self,
+        seed: Optional[bytes] = None,
+        *,
+        mock: Optional[bool] = None,
+    ) -> None:
+        # Decide mode: explicit flag > library availability
+        if mock is True or (mock is None and not _HAS_BITCOINLIB):
+            self._is_mock = True
             self._key = None
-            self._mock_sk = seed or secrets.token_bytes(32)
+            self._mock_sk: Optional[bytes] = seed or secrets.token_bytes(32)
+        else:
+            if not _HAS_BITCOINLIB:
+                raise RuntimeError(
+                    "bitcoinlib is required for real Taproot keys. "
+                    "Install it or pass mock=True for testing."
+                )
+            self._is_mock = False
+            self._key = BitcoinLibKey(seed) if seed else BitcoinLibKey()
+            self._mock_sk = None
+
+    @property
+    def is_mock(self) -> bool:
+        """True when operating with deterministic mock keys (test only)."""
+        return self._is_mock
 
     # -- properties -----------------------------------------------------
     @property
@@ -226,8 +255,9 @@ class TaprootKey:
         """BIP-340 Schnorr signature (64 bytes)."""
         if self._key is not None:
             return self._key.sign(message, use_rfc6979=True)
-        # Deterministic mock — NEVER used on-chain
+        # Mock path — log a warning so it's visible in production logs
         assert self._mock_sk is not None
+        log.debug("Mock Schnorr sign — NOT valid on-chain")
         return hmac.new(self._mock_sk, message, hashlib.sha256).digest() * 2  # 64 B
 
     # -- address --------------------------------------------------------
@@ -251,11 +281,15 @@ class HybridUTXO:
     UTXO guarded by *two* independent key types:
 
     1. **Taproot** (on-chain) — spendable today via BIP-341
-    2. **PQ key** (off-chain / future) — quantum-resistant enforcement
+    2. **PQ key** (off-chain attestation) — quantum-resistant signing
 
-    The *commitment* binds both public keys + a random salt + an
-    optional timelock height, allowing verifiers to confirm the UTXO
-    owner controls both classical and PQ secrets.
+    Commitment Semantics:
+        The commitment hash is an **off-chain cryptographic binding**
+        between the classical Taproot key and the PQ key, combined
+        with a random salt and optional timelock height.  It is
+        intended for auditing, custody policy enforcement, or future
+        protocol upgrades.  **It does not provide on-chain enforcement**
+        — Bitcoin nodes do not validate this commitment during spending.
     """
     taproot_key: TaprootKey
     pq_keypair: PQKeyPair
@@ -331,12 +365,18 @@ _PQ_PROPRIETARY_PREFIX = b"\xfc\x05pqbtc"   # 0xFC + len + "pqbtc"
 
 
 @dataclass
-class PSBTv2:
+class HybridPSBTContainer:
     """
-    Partially Signed Bitcoin Transaction (PSBT) v2.
+    Hybrid PSBT-compatible transaction container.
 
-    Extends BIP-370 with proprietary PQ signature fields carried in
-    the per-input proprietary map (key type 0xFC).
+    This is a PSBT-compatible metadata container, **not** a BIP-174/370
+    binary PSBT.  It serialises to JSON (base64-wrapped) and carries
+    PQ signature data in proprietary fields.  It does not interoperate
+    with Bitcoin Core, HWI, or hardware wallets at the binary level.
+
+    PQ signatures stored here are non-consensus and advisory.  On-chain
+    transaction validity is determined solely by the BIP-340 Schnorr
+    signatures in the witness.
     """
     version: int = 2
     tx_version: int = 2
@@ -499,6 +539,16 @@ class PSBTv2:
                 raise ValueError(
                     f"Input {sig_entry['input_index']} missing Taproot signature"
                 )
+            # Restrict to safe modes until full support is implemented
+            ht = sig_entry.get("hash_type", BIP341Sighash.SIGHASH_DEFAULT)
+            if ht not in (BIP341Sighash.SIGHASH_DEFAULT, BIP341Sighash.SIGHASH_ALL):
+                raise ValueError(
+                    f"finalize() only supports SIGHASH_DEFAULT (0x00) and "
+                    f"SIGHASH_ALL (0x01) — got 0x{ht:02x} on input "
+                    f"{sig_entry['input_index']}.  Script-path, annex, "
+                    f"SIGHASH_SINGLE, and SIGHASH_NONE are not yet safe "
+                    f"for broadcast."
+                )
 
         # --- build raw transaction ---
         raw = b""
@@ -605,7 +655,7 @@ class PSBTv2:
         return b64encode(json.dumps(blob, separators=(",", ":")).encode()).decode()
 
     @classmethod
-    def from_base64(cls, b64: str) -> "PSBTv2":
+    def from_base64(cls, b64: str) -> "HybridPSBTContainer":
         d = json.loads(b64decode(b64))
         return cls(
             version=d["version"],
@@ -615,6 +665,10 @@ class PSBTv2:
             outputs=d["tx"]["outputs"],
             pq_signatures=d.get("pq_sigs", []),
         )
+
+
+# Backward-compatible alias — will be removed in a future release
+PSBTv2 = HybridPSBTContainer
 
 
 # ============================================================
@@ -704,7 +758,7 @@ class HybridWalletCore:
         self,
         to_address: str,
         amount_sats: int,
-    ) -> PSBTv2:
+    ) -> HybridPSBTContainer:
         if amount_sats <= 0:
             raise ValueError("amount must be positive")
 
@@ -715,7 +769,7 @@ class HybridWalletCore:
                 f"Insufficient balance: need {amount_sats} sats"
             )
 
-        psbt = PSBTv2()
+        psbt = HybridPSBTContainer()
         for utxo in selected:
             psbt.add_input(utxo)
 
@@ -837,7 +891,15 @@ class HybridWalletCore:
 
 class HybridWallet:
     """
-    High-level wallet API.
+    High-level hybrid Taproot + PQ signing wallet.
+
+    This is a **research-grade hybrid custody system** providing:
+      - BIP-340/341 Schnorr signing (on-chain consensus)
+      - NIST PQ attestations (off-chain, advisory only)
+
+    On-chain transaction validity is determined solely by the Schnorr
+    signatures.  PQ signatures are non-consensus, non-enforceable,
+    and can be stripped without invalidating the transaction.
 
     >>> w = HybridWallet("testnet", PQScheme.FALCON_512)
     >>> addr = w.receive()
@@ -972,7 +1034,7 @@ def _run_demo() -> None:
     psbt_b64 = wallet.send(dest, 0.1)
     print(f"  PSBT: {len(psbt_b64)} chars (base64)")
 
-    psbt = PSBTv2.from_base64(psbt_b64)
+    psbt = HybridPSBTContainer.from_base64(psbt_b64)
     print(f"     Inputs:  {len(psbt.inputs)}")
     print(f"     Outputs: {len(psbt.outputs)}")
     print(f"     PQ sigs: {len(psbt.pq_signatures)}")
