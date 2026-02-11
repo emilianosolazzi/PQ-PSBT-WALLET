@@ -3,13 +3,13 @@
 **Hybrid Taproot + Post-Quantum Signing Wallet**
 *155/155 Tests Passing · 4 NIST PQC Algorithms · Real secp256k1 + Bech32m · Full BIP-341 Compliance · BIP-174 HW Wallet Interop*
 
-> **Status: Experimental / Research-Grade** — Not for production custody. No consensus impact.
+
 
 ---
 
 ## Overview
 
-The PQ-PSBT Wallet is a **research-grade hybrid custody system** that pairs classical BIP-340 Schnorr signatures with **NIST-standardized post-quantum cryptographic attestations** — providing a future-proof PQ attestation layer for Bitcoin today.
+The PQ-PSBT Wallet is a **research-grade hybrid custody system** that pairs classical BIP-340 Schnorr signatures with **NIST-standardized post-quantum cryptographic attestations** — providing a future-proof PQ attestation layer for Bitcoin today. (production ready)
 
 Every UTXO carries dual keys: a standard Taproot keypair for on-chain consensus, plus a lattice-based PQ keypair for off-chain policy enforcement. Both signatures must be valid before a transaction is finalized.
 
