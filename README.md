@@ -561,3 +561,10 @@ This project does **not** attempt or propose:
 
 *155/155 tests passing · 28 test classes · 4 NIST algorithms · Real secp256k1 + Bech32m · BIP-174 HW wallet interop · Zero mocks · Research-grade hybrid custody*
 Created by Emiliano G Solazzi 2026
+Commercial Use License for PQ-PSBT-WALLET
+
+This software is available under a commercial license for entities
+that cannot comply with the terms of the GNU General Public License
+version 3 (GPLv3).
+
+Contact: emiliano.arlington@gmail.com for pricing and terms.
