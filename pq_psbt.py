@@ -1,12 +1,12 @@
 """
-Production Hybrid Taproot + Post-Quantum PSBT Wallet
-=====================================================
+Production-Grade Hybrid Taproot + Post-Quantum Signing Wallet
+=============================================================
 - Taproot (SegWit v1) for on-chain BIP-340 Schnorr compatibility
-- NIST FIPS-204 ML-DSA (Dilithium) & Falcon signatures for PQ security
-- PSBT v2 proprietary fields for PQ signature transport
+- NIST FIPS-204 ML-DSA (Dilithium) & Falcon signatures for PQ attestations
+- PSBT-compatible metadata container with proprietary PQ signature data
 - BIP-341 sighash, BIP-32/44 key derivation awareness
 - AES-256-GCM encrypted wallet persistence
-- Constant-time verification throughout
+- Constant-time PQ signature verification (via pqcrypto C bindings)
 
 Dependencies:
     pip install pqcrypto pycryptodome bitcoinlib
@@ -16,6 +16,23 @@ Algorithms (NIST PQC standardised, Aug 2024):
     ML-DSA-87  (CRYSTALS-Dilithium5) — NIST Level 5 (256-bit)
     Falcon-512                       — NIST Level 1 (128-bit, compact sigs)
     Falcon-1024                      — NIST Level 5 (256-bit, compact sigs)
+
+Security Model:
+    - Bitcoin consensus security is provided **solely** by BIP-340/341
+      Schnorr signatures.  Post-quantum signatures provide additional
+      off-chain assurances only.
+    - PQ signatures are non-consensus, non-enforceable, and advisory.
+      They provide cryptographic attestations for off-chain policy,
+      auditing, or future soft-fork compatibility, but do not affect
+      transaction validity on the Bitcoin network today.
+    - Loss or stripping of PQ data does not affect transaction validity.
+    - This wallet does not attempt to change Bitcoin consensus rules.
+
+PSBT Note:
+    ``HybridPSBTContainer`` is a PSBT-compatible metadata container,
+    not a full BIP-174/BIP-370 binary PSBT.  It serialises to JSON
+    (base64-wrapped) and carries PQ signature data in proprietary fields.
+    It does not interoperate with Bitcoin Core / HWI at the binary level.
 """
 
 from __future__ import annotations
