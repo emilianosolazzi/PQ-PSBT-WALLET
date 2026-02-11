@@ -34,7 +34,7 @@ class BIP341Sighash:
     SIGHASH_SINGLE = 0x03
     SIGHASH_ANYONECANPAY = 0x80
     
-    def __init__(self, psbt: 'PSBTv2', input_index: int):
+    def __init__(self, psbt: 'HybridPSBTContainer', input_index: int):
         self.psbt = psbt
         self.input_index = input_index
         self.tx_version = psbt.tx_version
