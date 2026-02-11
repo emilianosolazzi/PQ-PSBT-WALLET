@@ -1,5 +1,6 @@
 """
 Production-Grade Hybrid Taproot + Post-Quantum Signing Wallet
+Created by Emiliano G Solazzi 2026
 =============================================================
 - Taproot (SegWit v1) for on-chain BIP-340 Schnorr compatibility
 - NIST FIPS-204 ML-DSA (Dilithium) & Falcon signatures for PQ attestations
