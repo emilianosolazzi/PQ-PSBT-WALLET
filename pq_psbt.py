@@ -33,6 +33,29 @@ PSBT Note:
     not a full BIP-174/BIP-370 binary PSBT.  It serialises to JSON
     (base64-wrapped) and carries PQ signature data in proprietary fields.
     It does not interoperate with Bitcoin Core / HWI at the binary level.
+
+PQ Cryptography Assumptions:
+    - PQ operations use ``pqcrypto`` (libpqcrypto C reference implementations).
+    - No formal side-channel audit has been performed on these bindings.
+    - Falcon implementations are inherently fragile (floating-point sampler);
+      constant-time guarantees depend on the platform and compiler.
+    - No hardware acceleration is assumed or required.
+    - PQ signature sizes (657 B – 4,627 B) materially affect bandwidth and
+      storage relative to 64-byte Schnorr signatures.
+
+Commitment Semantics:
+    The UTXO commitment ``SHA-256(taproot_pk || pq_pk || salt || height ||
+    chain_id)`` is computed and verified **off-chain only**.  It is not
+    enforced by Bitcoin Script, not included in the witness, and not
+    validated by consensus.  Its intended uses are custody policy
+    enforcement, auditing, and future soft-fork research.
+
+Replay Protection Note:
+    ``chain_id = SHA-256(network)[:4]`` prevents cross-network commitment
+    replay at the **off-chain PQ layer only**.  It does not prevent
+    on-chain transaction replay across forks.
+
+Status: Experimental / Research-Grade — not for production custody.
 """
 
 from __future__ import annotations
@@ -63,12 +86,11 @@ from Crypto.Protocol.KDF import scrypt
 # BIP-341 full sighash (supports all SIGHASH types)
 from bitcoin_protocol import BIP341Sighash, compact_size, tagged_hash
 
-# Optional: real Bitcoin key handling
-try:
-    from bitcoinlib.keys import Key as BitcoinLibKey
-    _HAS_BITCOINLIB = True
-except ImportError:
-    _HAS_BITCOINLIB = False
+# Real Bitcoin key handling: coincurve (libsecp256k1) + bech32
+from coincurve import PrivateKey as _Secp256k1PrivateKey
+from coincurve import PublicKeyXOnly as _Secp256k1PubKeyXOnly
+from bech32 import encode as _bech32_encode, decode as _bech32_decode
+_HAS_SECP256K1 = True   # always True — hard dependency now
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -207,85 +229,82 @@ def generate_pq_keypair(
 
 class TaprootKey:
     """
-    BIP-340 Schnorr key.
+    Real BIP-340 Schnorr key backed by libsecp256k1 (via ``coincurve``).
 
-    Operates in one of two mutually-exclusive modes:
+    All operations produce **on-chain-valid** signatures and addresses:
 
-    **Real mode** (``bitcoinlib`` available, ``mock=False``)
-        Full BIP-340 Schnorr sign/verify and Bech32m address encoding.
-        Safe for on-chain use.
+    * ``sign_schnorr()`` → 64-byte BIP-340 Schnorr signature
+    * ``verify_schnorr()`` → constant-time x-only verification
+    * ``taproot_address()`` → proper Bech32m bc1p/tb1p address
 
-    **Mock mode** (``bitcoinlib`` unavailable or ``mock=True``)
-        Deterministic HMAC-based signatures for structural / integration
-        tests only.  Will refuse to sign if ``allow_mock_signing`` is
-        ``False`` (the default for mainnet).
-
-    .. warning::
-
-       Mock Taproot keys **MUST NEVER** be used for on-chain transactions.
-       They produce invalid curve points and non-BIP-340 signatures.
+    No mock mode.  Every key is a real secp256k1 private key.
     """
 
     def __init__(
         self,
         seed: Optional[bytes] = None,
         *,
-        mock: Optional[bool] = None,
+        mock: Optional[bool] = None,  # ignored — kept for API compat
     ) -> None:
-        # Decide mode: explicit flag > library availability
-        if mock is True or (mock is None and not _HAS_BITCOINLIB):
-            self._is_mock = True
-            self._key = None
-            self._mock_sk: Optional[bytes] = seed or secrets.token_bytes(32)
-        else:
-            if not _HAS_BITCOINLIB:
-                raise RuntimeError(
-                    "bitcoinlib is required for real Taproot keys. "
-                    "Install it or pass mock=True for testing."
-                )
-            self._is_mock = False
-            self._key = BitcoinLibKey(seed) if seed else BitcoinLibKey()
-            self._mock_sk = None
+        if mock is not None:
+            log.info("TaprootKey: mock= parameter ignored — "
+                     "all keys are real secp256k1 now")
+        sk_bytes = seed if seed else secrets.token_bytes(32)
+        # Ensure valid scalar (1 < sk < curve order)
+        self._sk = _Secp256k1PrivateKey(sk_bytes)
+        self._pk_compressed: bytes = self._sk.public_key.format(compressed=True)
+        self._pk_xonly: bytes = self._pk_compressed[1:]  # 32-byte x-only
 
     @property
     def is_mock(self) -> bool:
-        """True when operating with deterministic mock keys (test only)."""
-        return self._is_mock
+        """Always False — all keys are real secp256k1."""
+        return False
 
     # -- properties -----------------------------------------------------
     @property
     def private_key(self) -> bytes:
-        if self._key is not None:
-            return self._key.private_byte
-        assert self._mock_sk is not None
-        return self._mock_sk
+        """32-byte raw secp256k1 secret scalar."""
+        return self._sk.secret
 
     @property
     def public_key(self) -> bytes:
-        if self._key is not None:
-            return self._key.public_byte
-        assert self._mock_sk is not None
-        return hashlib.sha256(self._mock_sk).digest() + b"\x02"  # 33 B
+        """33-byte compressed SEC1 public key (0x02/0x03 || x)."""
+        return self._pk_compressed
+
+    @property
+    def public_key_xonly(self) -> bytes:
+        """32-byte x-only public key (BIP-340)."""
+        return self._pk_xonly
 
     # -- crypto ---------------------------------------------------------
     def sign_schnorr(self, message: bytes) -> bytes:
-        """BIP-340 Schnorr signature (64 bytes)."""
-        if self._key is not None:
-            return self._key.sign(message, use_rfc6979=True)
-        # Mock path — log a warning so it's visible in production logs
-        assert self._mock_sk is not None
-        log.debug("Mock Schnorr sign — NOT valid on-chain")
-        return hmac.new(self._mock_sk, message, hashlib.sha256).digest() * 2  # 64 B
+        """BIP-340 Schnorr signature (64 bytes).
+
+        ``message`` must be a 32-byte sighash digest.
+        """
+        if len(message) != 32:
+            raise ValueError(
+                f"BIP-340 Schnorr sign requires a 32-byte digest, "
+                f"got {len(message)} bytes"
+            )
+        return self._sk.sign_schnorr(message)
+
+    def verify_schnorr(self, message: bytes, signature: bytes) -> bool:
+        """Verify a BIP-340 Schnorr signature."""
+        try:
+            pk_xonly = _Secp256k1PubKeyXOnly(self._pk_xonly)
+            return pk_xonly.verify(signature, message)
+        except Exception:
+            return False
 
     # -- address --------------------------------------------------------
     def taproot_address(self, network: str = "mainnet") -> str:
-        """Generate bc1p… Taproot (Bech32m) address."""
-        if self._key is not None:
-            return self._key.address(network=network, encoding="bech32")
-        # Deterministic mock
-        h = hashlib.sha256(self.public_key).digest()[:20]
-        prefix = "tb1p" if network in ("testnet", "signet") else "bc1p"
-        return prefix + h.hex()[:40]
+        """Generate a real Bech32m P2TR address."""
+        hrp = "tb" if network in ("testnet", "signet") else "bc"
+        addr = _bech32_encode(hrp, 1, list(self._pk_xonly))
+        if addr is None:
+            raise RuntimeError("Bech32m encoding failed")
+        return addr
 
 
 # ============================================================
@@ -326,7 +345,11 @@ class HybridUTXO:
     # ---- commitment ---------------------------------------------------
     @property
     def commitment_hash(self) -> bytes:
-        """C = SHA-256(taproot_pk || pq_pk || salt || height || chain_id)"""
+        """C = SHA-256(taproot_pk || pq_pk || salt || height || chain_id).
+
+        Off-chain only — not enforced by Script or consensus.
+        Used for custody policy, auditing, and soft-fork research.
+        """
         buf = (
             self.taproot_key.public_key
             + self.pq_keypair.public_key
@@ -524,23 +547,52 @@ class HybridPSBTContainer:
     # ---- helpers ------------------------------------------------------
     @staticmethod
     def _taproot_script(key: TaprootKey) -> str:
-        """OP_1 <32-byte x-only pubkey>  (P2TR scriptPubKey)."""
-        return "5120" + key.public_key.hex()[:64]
+        """OP_1 <32-byte x-only pubkey>  (P2TR scriptPubKey).
+
+        BIP-340 x-only pubkey = 32-byte x-coordinate only,
+        dropping the 1-byte parity prefix from the 33-byte
+        compressed SEC1 representation.
+        """
+        pk_bytes = key.public_key
+        if len(pk_bytes) == 33:
+            # Compressed SEC1: drop the 0x02/0x03 prefix → 32-byte x-only
+            x_only = pk_bytes[1:]
+        elif len(pk_bytes) == 32:
+            x_only = pk_bytes
+        else:
+            raise ValueError(
+                f"Unexpected pubkey length {len(pk_bytes)}: "
+                f"expected 32 (x-only) or 33 (compressed)"
+            )
+        return "5120" + x_only.hex()
 
     @staticmethod
     def _address_to_script(address: str) -> str:
-        if address.startswith(("bc1p", "tb1p")):
-            return "5120" + address[4:68]
-        return ""
+        """Decode a Bech32m P2TR address to its OP_1 <32B> scriptPubKey hex."""
+        if not address.startswith(("bc1", "tb1")):
+            return ""
+        hrp = "bc" if address.startswith("bc1") else "tb"
+        ver, prog = _bech32_decode(hrp, address)
+        if ver is None or prog is None:
+            raise ValueError(f"Invalid Bech32m address: {address}")
+        if ver != 1 or len(prog) != 32:
+            raise ValueError(
+                f"Expected witness v1 + 32-byte program, "
+                f"got v{ver} + {len(prog)} bytes"
+            )
+        return "5120" + bytes(prog).hex()
 
     # ---- finalise ------------------------------------------------------
-    def finalize(self) -> bytes:
+    def finalize(self, *, allow_mock: bool = False) -> bytes:
         """
         Validate that the PSBT is fully signed and serialize a
         broadcast-ready raw transaction.
 
         Returns the raw Bitcoin transaction bytes (ready for
         ``sendrawtransaction``).
+
+        ``allow_mock`` is accepted for API compat but ignored —
+        all keys are real secp256k1 now.
 
         Raises ValueError if any input is unsigned or incomplete.
         """
@@ -605,6 +657,8 @@ class HybridPSBTContainer:
         rpc_user: str = "bitcoin",
         rpc_pass: str = "",
         timeout: int = 30,
+        *,
+        allow_mock: bool = False,
     ) -> str:
         """
         Finalize the PSBT and broadcast the raw TX to a Bitcoin Core
@@ -921,7 +975,8 @@ class HybridWallet:
     >>> w = HybridWallet("testnet", PQScheme.FALCON_512)
     >>> addr = w.receive()
     >>> w.fund(addr, txid="ab"*32, vout=0, sats=500_000)
-    >>> psbt_b64 = w.send("tb1p" + "0"*40, 0.001)
+    >>> dest = TaprootKey().taproot_address("testnet")
+    >>> psbt_b64 = w.send(dest, 0.001)
     """
 
     def __init__(
@@ -1047,7 +1102,9 @@ def _run_demo() -> None:
     wallet.fund(addr, txid="ab" * 32, vout=0, sats=100_000_000)
     print(f"  {wallet.balance()}")
 
-    dest = "tb1p" + "0" * 40
+    # Use a real Bech32m destination for demo
+    dest_key = TaprootKey(seed=b"\x01" * 32)
+    dest = dest_key.taproot_address("testnet")
     psbt_b64 = wallet.send(dest, 0.1)
     print(f"  PSBT: {len(psbt_b64)} chars (base64)")
 
