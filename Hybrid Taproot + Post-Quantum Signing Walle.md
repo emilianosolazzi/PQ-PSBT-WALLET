@@ -1,23 +1,27 @@
 # PQ-PSBT Hybrid Wallet — Test Report
 
-**Post-Quantum Taproot PSBT Wallet**
-*19/19 Tests Passing · 4 NIST PQC Algorithms · Full BIP-341 Compliance*
+**Hybrid Taproot + Post-Quantum Signing Wallet**
+*23/23 Tests Passing · 4 NIST PQC Algorithms · Full BIP-341 Compliance*
 
 ---
 
 ## Overview
 
-The PQ-PSBT Wallet is a **production-grade hybrid Bitcoin wallet** that pairs classical BIP-340 Schnorr signatures with **NIST-standardized post-quantum cryptography** — making every transaction quantum-resistant today, without waiting for a Bitcoin soft fork.
+The PQ-PSBT Wallet is a **research-grade hybrid custody system** that pairs classical BIP-340 Schnorr signatures with **NIST-standardized post-quantum cryptographic attestations** — providing a future-proof PQ attestation layer for Bitcoin today.
 
-Every UTXO carries dual keys: a standard Taproot keypair for on-chain consensus, plus a lattice-based or hash-based PQ keypair for off-chain enforcement. Both signatures must be valid before a transaction is finalized.
+Every UTXO carries dual keys: a standard Taproot keypair for on-chain consensus, plus a lattice-based PQ keypair for off-chain policy enforcement. Both signatures must be valid before a transaction is finalized.
+
+> **Security Model:** Bitcoin consensus security is provided **solely** by BIP-340/341 Schnorr signatures. Post-quantum signatures in this wallet are **non-consensus, non-enforceable, and advisory only**. They provide cryptographic attestations for off-chain policy, auditing, or future soft-fork compatibility, but **do not affect transaction validity on the Bitcoin network today**. Loss or stripping of PQ data does not affect transaction validity.
+
+> **PSBT Note:** `HybridPSBTContainer` is a PSBT-compatible metadata container, **not** a BIP-174/BIP-370 binary PSBT. It serialises to JSON (base64-wrapped) and does not interoperate with Bitcoin Core / HWI at the binary level.
 
 ---
 
-## ✅ Test Results — 19 / 19 PASSED
+## ✅ Test Results — 23 / 23 PASSED
 
 ```
 Platform:  Python 3.13.7 · pytest 9.0.2 · pqcrypto 0.4.0 (C bindings)
-Runtime:   0.60 s total
+Runtime:   0.57 s total
 ```
 
 ### BIP-341 Compliance (3/3)
@@ -78,6 +82,17 @@ Runtime:   0.60 s total
 
 ---
 
+### Consensus Correctness (4/4)
+
+| # | Test | Status | What It Proves |
+|---|------|--------|----------------|
+| 20 | `test_taproot_key_mock_flag` | ✅ PASS | `TaprootKey` exposes `is_mock` so callers can gate on-chain use |
+| 21 | `test_taproot_key_auto_mock_without_bitcoinlib` | ✅ PASS | Without `bitcoinlib`, mock mode is auto-selected — never silent degradation |
+| 22 | `test_finalize_rejects_sighash_single` | ✅ PASS | `finalize()` hard-rejects SIGHASH_SINGLE/NONE until fully supported |
+| 23 | `test_finalize_accepts_sighash_all` | ✅ PASS | `finalize()` allows SIGHASH_DEFAULT and SIGHASH_ALL |
+
+---
+
 ## Algorithm Benchmarks
 
 Real performance on commodity hardware (single-threaded):
@@ -109,8 +124,8 @@ Real performance on commodity hardware (single-threaded):
 └───────────────────┬─────────────────────────────┘
                     │
 ┌───────────────────▼─────────────────────────────┐
-│                  PSBTv2                           │
-│  BIP-370 fields + PQ proprietary extensions      │
+│          HybridPSBTContainer                     │
+│  PSBT-compatible metadata (JSON, not BIP-370)    │
 │  Per-input BIP-341 sighash (all SIGHASH types)   │
 │  Dual signing: Schnorr + PQ                      │
 │  Raw TX serialization · JSON-RPC broadcast       │
@@ -143,8 +158,8 @@ Real performance on commodity hardware (single-threaded):
 | **Defence-in-Depth** | Self-verification after every PQ signing operation |
 | **Double-Spend Tracking** | Nullifier set prevents reuse of spent UTXOs |
 | **Encrypted Persistence** | AES-256-GCM + scrypt (N=2²⁰, r=8, p=1) wallet encryption |
-| **Finalization Checks** | All inputs must have both Schnorr and PQ signatures before broadcast |
-
+| **Finalization Checks** | All inputs must have both Schnorr and PQ signatures before broadcast || **Mock Key Isolation** | `TaprootKey.is_mock` flag prevents silent degradation; mock keys refuse mainnet signing |
+| **Safe-Mode Finalize** | `finalize()` hard-rejects SIGHASH_SINGLE, SIGHASH_NONE, script-path, and annex until fully supported |
 ---
 
 ## Self-Test Demo Output
@@ -174,11 +189,11 @@ ALL SELF-TESTS PASSED
 | Symmetric Crypto | AES-256-GCM via `pycryptodome` 3.22.0 |
 | KDF | scrypt (N=2²⁰, r=8, p=1, 32-byte key) |
 | Sighash | BIP-341 §4.1 with full SIGHASH type support |
-| PSBT Format | BIP-370 v2 + PQ proprietary fields |
+| PSBT Format | PSBT-compatible container (JSON, not BIP-370 binary) + PQ proprietary fields |
 | Broadcast | Bitcoin Core JSON-RPC `sendrawtransaction` |
-| Testing | pytest 9.0.2 — 19 tests, 0.60s |
+| Testing | pytest 9.0.2 — 23 tests, 0.57s |
 | Language | Python 3.13.7 |
 
 ---
 
-*19/19 tests passing · 4 NIST algorithms · Real C crypto · Production ready*
+*23/23 tests passing · 4 NIST algorithms · Real C crypto · Research-grade hybrid custody*
