@@ -5,9 +5,9 @@ from bitcoin_protocol import BIP341Sighash
 class TestBIP341Compliance:
     """Test sighash computation via BIP341Sighash for all hash types."""
 
-    def _make_psbt(self) -> PSBTv2:
-        """Build a PSBTv2 with 2 inputs and 2 outputs for sighash tests."""
-        psbt = PSBTv2()
+    def _make_psbt(self) -> HybridPSBTContainer:
+        """Build a HybridPSBTContainer with 2 inputs and 2 outputs for sighash tests."""
+        psbt = HybridPSBTContainer()
         utxo1 = HybridUTXO(
             taproot_key=TaprootKey(), pq_keypair=generate_pq_keypair(),
             salt=secrets.token_bytes(32), unlock_height=0,
@@ -97,7 +97,7 @@ class TestWalletOperations:
         
         # Create transaction
         psbt_b64 = wallet.send("tb1p" + "0"*40, 0.005)
-        psbt = PSBTv2.from_base64(psbt_b64)
+        psbt = HybridPSBTContainer.from_base64(psbt_b64)
         
         # Verify structure
         assert len(psbt.inputs) == 1
@@ -180,13 +180,13 @@ class TestSecurity:
 class TestBroadcast:
     """Tests for finalize() serialisation and broadcast_transaction()."""
 
-    def _signed_psbt(self) -> PSBTv2:
-        """Return a PSBTv2 with 1 signed input."""
+    def _signed_psbt(self) -> HybridPSBTContainer:
+        """Return a HybridPSBTContainer with 1 signed input."""
         wallet = HybridWallet("testnet")
         addr = wallet.receive()
         wallet.fund(addr, txid="ff" * 32, vout=0, sats=1_000_000)
         b64 = wallet.send("tb1p" + "0" * 40, 0.005)
-        return PSBTv2.from_base64(b64)
+        return HybridPSBTContainer.from_base64(b64)
 
     def test_finalize_returns_bytes(self):
         """finalize() must return non-empty raw TX bytes."""
@@ -199,7 +199,7 @@ class TestBroadcast:
 
     def test_finalize_unsigned_raises(self):
         """Finalizing an unsigned PSBT raises ValueError."""
-        psbt = PSBTv2()
+        psbt = HybridPSBTContainer()
         utxo = HybridUTXO(
             taproot_key=TaprootKey(), pq_keypair=generate_pq_keypair(),
             salt=secrets.token_bytes(32), unlock_height=0,
@@ -256,6 +256,45 @@ class TestBroadcast:
 
         with pytest.raises(RuntimeError, match="RPC HTTP 403"):
             psbt.broadcast_transaction(node_url="http://fake:8332", rpc_pass="x")
+
+
+class TestConsensusCorrectness:
+    """Tests for correctness fixes: mock isolation, finalize restrictions."""
+
+    def test_taproot_key_mock_flag(self):
+        """TaprootKey exposes is_mock so callers can gate on-chain use."""
+        key = TaprootKey(mock=True)
+        assert key.is_mock is True
+
+    def test_taproot_key_auto_mock_without_bitcoinlib(self):
+        """Without bitcoinlib, TaprootKey auto-selects mock mode."""
+        import pq_psbt as _mod
+        key = TaprootKey()
+        # In our test env bitcoinlib is not installed → must be mock
+        if not _mod._HAS_BITCOINLIB:
+            assert key.is_mock is True
+
+    def test_finalize_rejects_sighash_single(self):
+        """finalize() must reject SIGHASH_SINGLE until fully supported."""
+        wallet = HybridWallet("testnet")
+        addr = wallet.receive()
+        wallet.fund(addr, txid="fa" * 32, vout=0, sats=1_000_000)
+        psbt = wallet.core.create_transaction("tb1p" + "0" * 40, 500_000)
+        # Tamper the hash_type to SIGHASH_SINGLE
+        psbt.pq_signatures[0]["hash_type"] = BIP341Sighash.SIGHASH_SINGLE
+        with pytest.raises(ValueError, match="SIGHASH_SINGLE"):
+            psbt.finalize()
+
+    def test_finalize_accepts_sighash_all(self):
+        """finalize() allows SIGHASH_ALL (0x01)."""
+        wallet = HybridWallet("testnet")
+        addr = wallet.receive()
+        wallet.fund(addr, txid="fb" * 32, vout=0, sats=1_000_000)
+        psbt = wallet.core.create_transaction("tb1p" + "0" * 40, 500_000)
+        psbt.pq_signatures[0]["hash_type"] = BIP341Sighash.SIGHASH_ALL
+        raw = psbt.finalize()
+        assert isinstance(raw, bytes)
+        assert len(raw) > 0
 
 
 if __name__ == "__main__":
