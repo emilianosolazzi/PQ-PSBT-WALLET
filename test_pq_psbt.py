@@ -1519,5 +1519,261 @@ class TestPQCrossSchemeSecurity:
                 f"{scheme.value} sk: expected {sk_sz}, got {len(kp.private_key)}"
 
 
+# ====================================================================
+# BIP-174 BINARY PSBT & HARDWARE WALLET INTEROP TESTS
+# ====================================================================
+
+
+class TestBIP174BinaryPSBT:
+    """BIP-174 binary serialization must produce valid, parseable PSBTs."""
+
+    def _make_signed_psbt(self, n_inputs=1):
+        wallet = HybridWallet("testnet")
+        utxos = []
+        for i in range(n_inputs):
+            addr = wallet.receive()
+            wallet.fund(addr, txid=f"{i+1:02x}" * 32, vout=i, sats=500_000)
+            utxos.append(wallet.core.utxos[-1])
+        psbt = wallet.core.create_transaction(_DEST1, 100_000)
+        return psbt, utxos
+
+    def test_psbt_magic_bytes(self):
+        """BIP-174 PSBT must start with 'psbt' + 0xFF."""
+        psbt, _ = self._make_signed_psbt()
+        raw = psbt.to_psbt_v0()
+        assert raw[:5] == b"psbt\xff"
+
+    def test_psbt_roundtrip_preserves_inputs(self):
+        """Serialize → parse must preserve input count and txids."""
+        psbt, _ = self._make_signed_psbt(2)
+        raw = psbt.to_psbt_v0()
+        restored = HybridPSBTContainer.from_psbt_v0(raw)
+        assert len(restored.inputs) == len(psbt.inputs)
+        for orig, rest in zip(psbt.inputs, restored.inputs):
+            assert orig["txid"] == rest["txid"]
+            assert orig["vout"] == rest["vout"]
+
+    def test_psbt_roundtrip_preserves_outputs(self):
+        """Serialize → parse must preserve output count and amounts."""
+        psbt, _ = self._make_signed_psbt()
+        raw = psbt.to_psbt_v0()
+        restored = HybridPSBTContainer.from_psbt_v0(raw)
+        assert len(restored.outputs) == len(psbt.outputs)
+        for orig, rest in zip(psbt.outputs, restored.outputs):
+            assert orig["amount"] == rest["amount"]
+            assert orig["scriptPubKey"] == rest["scriptPubKey"]
+
+    def test_psbt_roundtrip_preserves_taproot_sig(self):
+        """Schnorr signatures survive BIP-174 round-trip."""
+        psbt, _ = self._make_signed_psbt()
+        raw = psbt.to_psbt_v0()
+        restored = HybridPSBTContainer.from_psbt_v0(raw)
+        assert len(restored.pq_signatures) >= 1
+        orig_sig = psbt.pq_signatures[0]["taproot_sig"]
+        rest_sig = restored.pq_signatures[0]["taproot_sig"]
+        assert orig_sig == rest_sig
+
+    def test_psbt_roundtrip_preserves_pq_sig(self):
+        """PQ signatures in proprietary fields survive round-trip."""
+        psbt, _ = self._make_signed_psbt()
+        raw = psbt.to_psbt_v0(include_pq=True)
+        restored = HybridPSBTContainer.from_psbt_v0(raw)
+        orig_pq = psbt.pq_signatures[0].get("pq_sig", "")
+        rest_pq = restored.pq_signatures[0].get("pq_sig", "")
+        assert orig_pq == rest_pq
+
+    def test_psbt_without_pq_omits_proprietary(self):
+        """include_pq=False must not emit any 0xFC proprietary keys."""
+        psbt, _ = self._make_signed_psbt()
+        raw = psbt.to_psbt_v0(include_pq=False)
+        # The proprietary prefix should not appear in the binary
+        assert b"\x05pqbtc" not in raw
+
+    def test_psbt_with_pq_includes_proprietary(self):
+        """include_pq=True must embed proprietary PQ fields."""
+        psbt, _ = self._make_signed_psbt()
+        raw = psbt.to_psbt_v0(include_pq=True)
+        assert b"\x05pqbtc" in raw
+
+    def test_psbt_b64_roundtrip(self):
+        """Base64 encode → decode round-trip."""
+        psbt, _ = self._make_signed_psbt()
+        b64 = psbt.to_psbt_b64()
+        restored = HybridPSBTContainer.from_psbt_b64(b64)
+        assert len(restored.inputs) == len(psbt.inputs)
+        assert len(restored.outputs) == len(psbt.outputs)
+
+    def test_psbt_preserves_tx_version(self):
+        """TX version must survive round-trip."""
+        psbt, _ = self._make_signed_psbt()
+        raw = psbt.to_psbt_v0()
+        restored = HybridPSBTContainer.from_psbt_v0(raw)
+        assert restored.tx_version == psbt.tx_version
+
+    def test_psbt_preserves_locktime(self):
+        """Locktime must survive round-trip."""
+        psbt, _ = self._make_signed_psbt()
+        raw = psbt.to_psbt_v0()
+        restored = HybridPSBTContainer.from_psbt_v0(raw)
+        assert restored.locktime == psbt.locktime
+
+    def test_psbt_preserves_sequence(self):
+        """Per-input nSequence must survive round-trip."""
+        psbt, _ = self._make_signed_psbt()
+        raw = psbt.to_psbt_v0()
+        restored = HybridPSBTContainer.from_psbt_v0(raw)
+        for orig, rest in zip(psbt.inputs, restored.inputs):
+            assert orig.get("sequence", 0xFFFFFFFD) == rest["sequence"]
+
+    def test_psbt_preserves_witness_utxo(self):
+        """PSBT_IN_WITNESS_UTXO must survive round-trip."""
+        psbt, _ = self._make_signed_psbt()
+        raw = psbt.to_psbt_v0()
+        restored = HybridPSBTContainer.from_psbt_v0(raw)
+        for orig, rest in zip(psbt.inputs, restored.inputs):
+            assert "witness_utxo" in rest
+            assert orig["witness_utxo"]["amount"] == rest["witness_utxo"]["amount"]
+
+    def test_psbt_preserves_tap_internal_key(self):
+        """PSBT_IN_TAP_INTERNAL_KEY (0x17) must survive round-trip."""
+        psbt, _ = self._make_signed_psbt()
+        raw = psbt.to_psbt_v0()
+        restored = HybridPSBTContainer.from_psbt_v0(raw)
+        for rest_inp in restored.inputs:
+            pk = rest_inp.get("taproot_pubkey", "")
+            assert len(bytes.fromhex(pk)) == 32  # x-only
+
+    def test_psbt_invalid_magic_raises(self):
+        """Garbage bytes must be rejected."""
+        with pytest.raises(ValueError, match="bad magic"):
+            HybridPSBTContainer.from_psbt_v0(b"not a psbt")
+
+    def test_psbt_multi_input_roundtrip(self):
+        """3-input PSBT must round-trip correctly."""
+        # Send enough to force coin-selection to pick all 3 UTXOs
+        wallet = HybridWallet("testnet")
+        for i in range(3):
+            addr = wallet.receive()
+            wallet.fund(addr, txid=f"{i+1:02x}" * 32, vout=i, sats=500_000)
+        psbt = wallet.core.create_transaction(_DEST1, 1_200_000)
+        raw = psbt.to_psbt_v0()
+        restored = HybridPSBTContainer.from_psbt_v0(raw)
+        assert len(restored.inputs) == 3
+        assert len(restored.pq_signatures) == 3
+
+
+class TestHWISigningWorkflow:
+    """Simulate the full hardware wallet signing workflow."""
+
+    def test_merge_hw_signatures_adds_schnorr(self):
+        """HW signatures are merged into PSBT preserving PQ sigs."""
+        wallet = HybridWallet("testnet")
+        addr = wallet.receive()
+        wallet.fund(addr, txid="aa" * 32, vout=0, sats=500_000)
+        utxo = wallet.core.utxos[0]
+
+        # Step 1: Build PSBT with PQ signatures (wallet-side)
+        psbt = HybridPSBTContainer()
+        psbt.add_input(utxo)
+        psbt.add_output(_DEST1, 200_000)
+        psbt.sign_inputs([utxo])
+        original_pq_sig = psbt.pq_signatures[0]["pq_sig"]
+        original_schnorr = psbt.pq_signatures[0]["taproot_sig"]
+
+        # Step 2: Simulate HW wallet returning a different Schnorr sig
+        hw_psbt = HybridPSBTContainer()
+        hw_psbt.pq_signatures = [{
+            "input_index": 0,
+            "taproot_sig": "bb" * 64,  # simulated HW signature
+            "hash_type": BIP341Sighash.SIGHASH_DEFAULT,
+        }]
+
+        # Step 3: Merge
+        psbt.merge_hw_signatures(hw_psbt)
+
+        # Verify: Schnorr replaced, PQ preserved
+        assert psbt.pq_signatures[0]["taproot_sig"] == "bb" * 64
+        assert psbt.pq_signatures[0]["pq_sig"] == original_pq_sig
+
+    def test_merge_on_unsigned_psbt(self):
+        """Merging HW sigs into a PSBT that only has PQ sigs works."""
+        wallet = HybridWallet("testnet")
+        addr = wallet.receive()
+        wallet.fund(addr, txid="cc" * 32, vout=0, sats=500_000)
+        utxo = wallet.core.utxos[0]
+
+        # PSBT with only PQ sig (no Schnorr yet)
+        psbt = HybridPSBTContainer()
+        psbt.add_input(utxo)
+        psbt.add_output(_DEST1, 200_000)
+
+        # Manually add PQ-only sig entry
+        sighash = psbt._compute_sighash(0)
+        pq_sig = utxo.pq_keypair.sign(sighash)
+        psbt.pq_signatures.append({
+            "input_index": 0,
+            "pq_sig": base64.b64encode(pq_sig).decode(),
+            "pq_scheme": utxo.pq_keypair.scheme.value,
+        })
+
+        # Simulate HW wallet
+        hw_psbt = HybridPSBTContainer()
+        schnorr_sig = utxo.taproot_key.sign_schnorr(sighash)
+        hw_psbt.pq_signatures = [{
+            "input_index": 0,
+            "taproot_sig": schnorr_sig.hex(),
+            "hash_type": BIP341Sighash.SIGHASH_DEFAULT,
+        }]
+
+        # Merge and finalize
+        psbt.merge_hw_signatures(hw_psbt)
+        assert psbt.pq_signatures[0]["taproot_sig"] == schnorr_sig.hex()
+        assert psbt.pq_signatures[0].get("pq_sig") is not None
+
+    def test_full_hwi_roundtrip(self):
+        """Full workflow: build → export BIP-174 → parse → merge → finalize."""
+        wallet = HybridWallet("testnet")
+        addr = wallet.receive()
+        wallet.fund(addr, txid="dd" * 32, vout=0, sats=500_000)
+        utxo = wallet.core.utxos[0]
+
+        # 1. Build and PQ-sign
+        psbt = wallet.core.create_transaction(_DEST1, 100_000)
+
+        # 2. Export to BIP-174 binary (no PQ for HW wallet)
+        psbt_bytes = psbt.to_psbt_v0(include_pq=False)
+        assert psbt_bytes[:5] == b"psbt\xff"
+        assert b"\x05pqbtc" not in psbt_bytes  # no PQ in HW export
+
+        # 3. Parse back (simulating what a coordinator does)
+        parsed = HybridPSBTContainer.from_psbt_v0(psbt_bytes)
+        assert len(parsed.inputs) == len(psbt.inputs)
+
+        # 4. Export with PQ (for archival/policy)
+        psbt_with_pq = psbt.to_psbt_v0(include_pq=True)
+        assert b"\x05pqbtc" in psbt_with_pq
+
+        # 5. The original PSBT can still finalize (it already has sigs)
+        raw_tx = psbt.finalize()
+        assert raw_tx[:4] == struct.pack("<I", 2)  # nVersion = 2
+
+    def test_export_unsigned_for_hw(self):
+        """An unsigned PSBT export (before sign_inputs) has no sigs."""
+        wallet = HybridWallet("testnet")
+        addr = wallet.receive()
+        wallet.fund(addr, txid="ee" * 32, vout=0, sats=500_000)
+        utxo = wallet.core.utxos[0]
+
+        psbt = HybridPSBTContainer()
+        psbt.add_input(utxo)
+        psbt.add_output(_DEST1, 200_000)
+        # Don't sign — export unsigned
+        raw = psbt.to_psbt_v0(include_pq=False)
+        parsed = HybridPSBTContainer.from_psbt_v0(raw)
+        assert len(parsed.pq_signatures) == 0  # no sigs yet
+        assert len(parsed.inputs) == 1
+        assert parsed.inputs[0].get("witness_utxo") is not None
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
