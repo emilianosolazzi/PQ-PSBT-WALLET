@@ -560,3 +560,4 @@ This project does **not** attempt or propose:
 ---
 
 *155/155 tests passing · 28 test classes · 4 NIST algorithms · Real secp256k1 + Bech32m · BIP-174 HW wallet interop · Zero mocks · Research-grade hybrid custody*
+Created by Emiliano G Solazzi 2026
