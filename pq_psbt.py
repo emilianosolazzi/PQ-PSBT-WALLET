@@ -737,6 +737,326 @@ class HybridPSBTContainer:
             pq_signatures=d.get("pq_sigs", []),
         )
 
+    # ---- BIP-174 binary PSBT (hardware wallet interop) ----------------
+
+    # BIP-174 key types — per-input
+    _PSBT_IN_WITNESS_UTXO = 0x01
+    _PSBT_IN_TAP_KEY_SIG = 0x13
+    _PSBT_IN_TAP_INTERNAL_KEY = 0x17
+    # BIP-174 proprietary key type
+    _PSBT_PROPRIETARY = 0xFC
+
+    @staticmethod
+    def _psbt_key_value(key: bytes, value: bytes) -> bytes:
+        """Encode one BIP-174 key-value pair: <key-len><key><value-len><value>."""
+        return _compact_size(len(key)) + key + _compact_size(len(value)) + value
+
+    def _build_unsigned_tx(self) -> bytes:
+        """Build the unsigned transaction (no witness) for the PSBT global."""
+        raw = struct.pack("<I", self.tx_version)
+        # No segwit marker/flag in unsigned TX
+        raw += _compact_size(len(self.inputs))
+        for inp in self.inputs:
+            raw += bytes.fromhex(inp["txid"])[::-1]
+            raw += struct.pack("<I", inp["vout"])
+            raw += b"\x00"  # empty scriptSig
+            raw += struct.pack("<I", inp.get("sequence", 0xFFFFFFFD))
+        raw += _compact_size(len(self.outputs))
+        for out in self.outputs:
+            raw += struct.pack("<q", out["amount"])
+            spk = bytes.fromhex(out["scriptPubKey"])
+            raw += _compact_size(len(spk)) + spk
+        raw += struct.pack("<I", self.locktime)
+        return raw
+
+    def to_psbt_v0(self, *, include_pq: bool = True) -> bytes:
+        """
+        Serialize to BIP-174 binary PSBT format (version 0).
+
+        This produces a standards-compliant PSBT that can be loaded
+        into Bitcoin Core, Sparrow, Ledger, Trezor, or any HWI-based
+        signer for Schnorr (Taproot key-path) signing.
+
+        Args:
+            include_pq: If True, embed PQ data in proprietary fields
+                        (0xFC "pqbtc" namespace).  Hardware wallets
+                        will silently ignore proprietary fields.
+                        If False, omit PQ data entirely.
+
+        Returns:
+            Raw BIP-174 PSBT bytes (pass to ``to_psbt_b64()`` for
+            base64 encoding).
+        """
+        buf = b"psbt\xff"  # BIP-174 magic + separator
+
+        # ---- Global: unsigned TX (key 0x00) ----
+        unsigned_tx = self._build_unsigned_tx()
+        buf += self._psbt_key_value(b"\x00", unsigned_tx)
+        buf += b"\x00"  # global separator
+
+        # ---- Per-input maps ----
+        for idx, inp in enumerate(self.inputs):
+            # PSBT_IN_WITNESS_UTXO (0x01): serialized previous output
+            wu = inp.get("witness_utxo", {})
+            if wu:
+                amount = struct.pack("<q", wu["amount"])
+                spk = bytes.fromhex(wu["scriptPubKey"])
+                witness_utxo_val = amount + _compact_size(len(spk)) + spk
+                buf += self._psbt_key_value(b"\x01", witness_utxo_val)
+
+            # PSBT_IN_TAP_INTERNAL_KEY (0x17): 32-byte x-only pubkey
+            tap_pk_hex = inp.get("taproot_pubkey", "")
+            if tap_pk_hex:
+                pk_bytes = bytes.fromhex(tap_pk_hex)
+                # Drop SEC1 prefix if 33 bytes
+                xonly = pk_bytes[1:] if len(pk_bytes) == 33 else pk_bytes
+                buf += self._psbt_key_value(b"\x17", xonly)
+
+            # PSBT_IN_TAP_KEY_SIG (0x13): if already signed
+            sig_entry = next(
+                (s for s in self.pq_signatures if s["input_index"] == idx),
+                None,
+            )
+            if sig_entry and sig_entry.get("taproot_sig"):
+                sig_bytes = bytes.fromhex(sig_entry["taproot_sig"])
+                buf += self._psbt_key_value(b"\x13", sig_bytes)
+
+            # Proprietary PQ fields (0xFC + "pqbtc" + sub-type)
+            if include_pq:
+                prop = inp.get("proprietary", {})
+                if prop:
+                    # Sub-type 0x01: PQ public key
+                    pq_pk = prop.get("pq_pubkey", "")
+                    if pq_pk:
+                        key = _PQ_PROPRIETARY_PREFIX + b"\x01"
+                        buf += self._psbt_key_value(key, bytes.fromhex(pq_pk))
+
+                    # Sub-type 0x02: PQ scheme name (utf-8)
+                    pq_scheme = prop.get("pq_scheme", "")
+                    if pq_scheme:
+                        key = _PQ_PROPRIETARY_PREFIX + b"\x02"
+                        buf += self._psbt_key_value(key, pq_scheme.encode())
+
+                    # Sub-type 0x03: salt
+                    salt_hex = prop.get("salt", "")
+                    if salt_hex:
+                        key = _PQ_PROPRIETARY_PREFIX + b"\x03"
+                        buf += self._psbt_key_value(key, bytes.fromhex(salt_hex))
+
+                    # Sub-type 0x04: commitment hash
+                    commit_hex = prop.get("commitment", "")
+                    if commit_hex:
+                        key = _PQ_PROPRIETARY_PREFIX + b"\x04"
+                        buf += self._psbt_key_value(key, bytes.fromhex(commit_hex))
+
+                # PQ signature if present
+                if sig_entry:
+                    pq_sig_b64 = sig_entry.get("pq_sig", "")
+                    if pq_sig_b64:
+                        key = _PQ_PROPRIETARY_PREFIX + b"\x10"
+                        buf += self._psbt_key_value(key, b64decode(pq_sig_b64))
+
+            buf += b"\x00"  # input separator
+
+        # ---- Per-output maps ----
+        for out in self.outputs:
+            # We include the scriptPubKey for completeness but BIP-174
+            # doesn't require per-output fields for simple spends.
+            buf += b"\x00"  # output separator (empty map)
+
+        return buf
+
+    def to_psbt_b64(self, *, include_pq: bool = True) -> str:
+        """Return BIP-174 PSBT as base64 string (for HWI / Bitcoin Core)."""
+        return b64encode(self.to_psbt_v0(include_pq=include_pq)).decode()
+
+    @classmethod
+    def from_psbt_v0(cls, data: bytes) -> "HybridPSBTContainer":
+        """
+        Parse a BIP-174 binary PSBT and reconstruct a HybridPSBTContainer.
+
+        Handles signed PSBTs returned from hardware wallets — merges
+        Taproot key-path signatures (PSBT_IN_TAP_KEY_SIG 0x13) and
+        preserves any proprietary PQ fields.
+        """
+        if data[:5] != b"psbt\xff":
+            raise ValueError("Not a valid BIP-174 PSBT (bad magic)")
+
+        pos = 5
+        container = cls()
+
+        def _read_compact_size(d: bytes, p: int) -> tuple:
+            b0 = d[p]
+            if b0 < 0xFD:
+                return b0, p + 1
+            elif b0 == 0xFD:
+                return struct.unpack_from("<H", d, p + 1)[0], p + 3
+            elif b0 == 0xFE:
+                return struct.unpack_from("<I", d, p + 1)[0], p + 5
+            else:
+                return struct.unpack_from("<Q", d, p + 1)[0], p + 9
+
+        def _read_kv(d: bytes, p: int):
+            """Read one key-value pair. Returns (key, value, new_pos) or None at separator."""
+            key_len, p = _read_compact_size(d, p)
+            if key_len == 0:
+                return None, None, p  # separator
+            key = d[p:p + key_len]
+            p += key_len
+            val_len, p = _read_compact_size(d, p)
+            val = d[p:p + val_len]
+            p += val_len
+            return key, val, p
+
+        # ---- Parse global map ----
+        unsigned_tx = b""
+        while pos < len(data):
+            key, val, pos = _read_kv(data, pos)
+            if key is None:
+                break
+            if key == b"\x00":
+                unsigned_tx = val
+
+        # Parse unsigned TX to extract inputs/outputs
+        if unsigned_tx:
+            tp = 0
+            tx_ver = struct.unpack_from("<I", unsigned_tx, tp)[0]
+            container.tx_version = tx_ver
+            tp += 4
+            n_in, tp = _read_compact_size(unsigned_tx, tp)
+            for _ in range(n_in):
+                txid_le = unsigned_tx[tp:tp + 32]
+                tp += 32
+                vout = struct.unpack_from("<I", unsigned_tx, tp)[0]
+                tp += 4
+                script_len, tp = _read_compact_size(unsigned_tx, tp)
+                tp += script_len  # skip scriptSig
+                seq = struct.unpack_from("<I", unsigned_tx, tp)[0]
+                tp += 4
+                container.inputs.append({
+                    "txid": txid_le[::-1].hex(),
+                    "vout": vout,
+                    "sequence": seq,
+                })
+            n_out, tp = _read_compact_size(unsigned_tx, tp)
+            for _ in range(n_out):
+                amount = struct.unpack_from("<q", unsigned_tx, tp)[0]
+                tp += 8
+                spk_len, tp = _read_compact_size(unsigned_tx, tp)
+                spk = unsigned_tx[tp:tp + spk_len]
+                tp += spk_len
+                container.outputs.append({
+                    "amount": amount,
+                    "scriptPubKey": spk.hex(),
+                })
+            container.locktime = struct.unpack_from("<I", unsigned_tx, tp)[0]
+
+        # ---- Parse per-input maps ----
+        pq_prefix = _PQ_PROPRIETARY_PREFIX
+        for idx in range(len(container.inputs)):
+            pq_data: Dict[str, Any] = {}
+            sig_data: Dict[str, Any] = {"input_index": idx}
+
+            while pos < len(data):
+                key, val, pos = _read_kv(data, pos)
+                if key is None:
+                    break
+
+                key_type = key[0]
+                if key_type == 0x01:  # WITNESS_UTXO
+                    # Parse amount + scriptPubKey
+                    wu_amount = struct.unpack_from("<q", val, 0)[0]
+                    spk_len_b = val[8]
+                    spk_hex = val[9:9 + spk_len_b].hex()
+                    container.inputs[idx]["witness_utxo"] = {
+                        "amount": wu_amount,
+                        "scriptPubKey": spk_hex,
+                    }
+                    container.inputs[idx]["amount"] = wu_amount
+                elif key_type == 0x17:  # TAP_INTERNAL_KEY
+                    container.inputs[idx]["taproot_pubkey"] = val.hex()
+                elif key_type == 0x13:  # TAP_KEY_SIG
+                    sig_data["taproot_sig"] = val.hex()
+                    sig_data["hash_type"] = (
+                        val[64] if len(val) == 65
+                        else BIP341Sighash.SIGHASH_DEFAULT
+                    )
+                elif key_type == 0xFC and key[1:].startswith(b"\x05pqbtc"):
+                    sub_type = key[len(pq_prefix):]
+                    if sub_type == b"\x01":
+                        pq_data["pq_pubkey"] = val.hex()
+                    elif sub_type == b"\x02":
+                        pq_data["pq_scheme"] = val.decode()
+                    elif sub_type == b"\x03":
+                        pq_data["salt"] = val.hex()
+                    elif sub_type == b"\x04":
+                        pq_data["commitment"] = val.hex()
+                    elif sub_type == b"\x10":
+                        sig_data["pq_sig"] = b64encode(val).decode()
+                        sig_data["pq_sig_bytes"] = len(val)
+
+            if pq_data:
+                container.inputs[idx]["proprietary"] = pq_data
+            if sig_data.get("taproot_sig") or sig_data.get("pq_sig"):
+                container.pq_signatures.append(sig_data)
+
+        # ---- Parse per-output maps (skip for now) ----
+        for _ in range(len(container.outputs)):
+            if pos < len(data):
+                while pos < len(data):
+                    key, val, pos = _read_kv(data, pos)
+                    if key is None:
+                        break
+
+        return container
+
+    @classmethod
+    def from_psbt_b64(cls, b64: str) -> "HybridPSBTContainer":
+        """Parse a base64-encoded BIP-174 PSBT."""
+        return cls.from_psbt_v0(b64decode(b64))
+
+    def merge_hw_signatures(self, signed_psbt: "HybridPSBTContainer") -> None:
+        """
+        Merge Taproot key-path signatures from a hardware-wallet-signed
+        PSBT into this container, preserving existing PQ signatures.
+
+        Typical workflow:
+          1. ``unsigned = psbt.to_psbt_b64(include_pq=False)``
+          2. Send to Ledger/Trezor via HWI → get signed PSBT back
+          3. ``signed = HybridPSBTContainer.from_psbt_b64(signed_b64)``
+          4. ``psbt.merge_hw_signatures(signed)``
+          5. Now ``psbt`` has both Schnorr (from HW) and PQ (from wallet)
+        """
+        hw_sigs = {s["input_index"]: s for s in signed_psbt.pq_signatures}
+
+        for idx in range(len(self.inputs)):
+            hw_sig = hw_sigs.get(idx)
+            if not hw_sig or not hw_sig.get("taproot_sig"):
+                continue
+
+            # Find existing PQ sig entry for this input
+            existing = next(
+                (s for s in self.pq_signatures if s["input_index"] == idx),
+                None,
+            )
+            if existing:
+                # Merge: keep PQ sig, add HW Schnorr sig
+                existing["taproot_sig"] = hw_sig["taproot_sig"]
+                existing["hash_type"] = hw_sig.get(
+                    "hash_type", BIP341Sighash.SIGHASH_DEFAULT
+                )
+            else:
+                # No PQ sig yet — just store Schnorr
+                self.pq_signatures.append({
+                    "input_index": idx,
+                    "taproot_sig": hw_sig["taproot_sig"],
+                    "hash_type": hw_sig.get(
+                        "hash_type", BIP341Sighash.SIGHASH_DEFAULT
+                    ),
+                })
+
+        log.info("Merged %d HW signatures into PSBT", len(hw_sigs))
+
 
 # Backward-compatible alias — will be removed in a future release
 PSBTv2 = HybridPSBTContainer
