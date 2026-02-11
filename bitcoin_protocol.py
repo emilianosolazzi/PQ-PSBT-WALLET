@@ -108,7 +108,7 @@ class BIP341Sighash:
         # === Input-specific data (if ANYONECANPAY) ===
         if hash_type & self.SIGHASH_ANYONECANPAY:
             inp = self.psbt.inputs[self.input_index]
-            msg += bytes.fromhex(inp["txid"])
+            msg += bytes.fromhex(inp["txid"])[::-1]  # internal byte order
             msg += struct.pack("<I", inp["vout"])
             msg += struct.pack("<q", inp["amount"])
             spk = bytes.fromhex(inp["witness_utxo"]["scriptPubKey"])
@@ -134,9 +134,9 @@ class BIP341Sighash:
     # === Helper methods for hashing transaction data ===
     
     def _sha_prevouts(self) -> bytes:
-        """SHA-256 of all input outpoints."""
+        """SHA-256 of all input outpoints (txid in internal byte order)."""
         data = b''.join(
-            bytes.fromhex(inp["txid"]) + struct.pack("<I", inp["vout"])
+            bytes.fromhex(inp["txid"])[::-1] + struct.pack("<I", inp["vout"])
             for inp in self.psbt.inputs
         )
         return hashlib.sha256(data).digest()
@@ -177,9 +177,6 @@ class BIP341Sighash:
     def _sha_single_output(self, index: int) -> bytes:
         """SHA-256 of single output (for SIGHASH_SINGLE)."""
         out = self.psbt.outputs[index]
-        data = (
-            struct.pack("<q", out["amount"]) +
-            compact_size(len(spk := bytes.fromhex(out["scriptPubKey"]))) +
-            bytes.fromhex(out["scriptPubKey"])
-        )
+        spk = bytes.fromhex(out["scriptPubKey"])
+        data = struct.pack("<q", out["amount"]) + compact_size(len(spk)) + spk
         return hashlib.sha256(data).digest()
