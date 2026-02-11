@@ -1,7 +1,7 @@
 # PQ-PSBT Hybrid Wallet
 
 **Hybrid Taproot + Post-Quantum Signing Wallet**
-*136/136 Tests Passing · 4 NIST PQC Algorithms · Real secp256k1 + Bech32m · Full BIP-341 Compliance*
+*155/155 Tests Passing · 4 NIST PQC Algorithms · Real secp256k1 + Bech32m · Full BIP-341 Compliance · BIP-174 HW Wallet Interop*
 
 > **Status: Experimental / Research-Grade** — Not for production custody. No consensus impact.
 
@@ -31,7 +31,7 @@ python -m pytest test_pq_psbt.py -v
 
 ---
 
-## Test Suite — 136/136 PASSED
+## Test Suite — 155/155 PASSED
 
 ```
 Platform:  Python 3.13.7 · pytest 9.0.2
@@ -68,7 +68,9 @@ Mocks:     0
 | **Encrypted Persistence Hardened** | **3** | **Corrupted ciphertext MAC fail, corrupted tag fail, empty password** |
 | **Tagged Hash Conformance** | **6** | **32B, deterministic, spec-match SHA256(tag‖tag‖msg), CompactSize boundaries** |
 | **PQ Cross-Scheme Security** | **5** | **Falcon✗Dilithium, DSA-65✗87, empty msg, 1MB msg, NIST key sizes** |
-| **Total** | **136** | |
+| **BIP-174 Binary PSBT** | **15** | **Magic bytes, input/output/sig roundtrip, PQ proprietary fields, b64, tx_version, locktime, sequence, witness_utxo, tap_internal_key, invalid magic reject, multi-input** |
+| **HWI Signing Workflow** | **4** | **HW sig merge, merge on unsigned, full HWI roundtrip, export unsigned for HW** |
+| **Total** | **155** | |
 
 ---
 
@@ -89,7 +91,7 @@ Mocks:     0
 ```
 HybridWallet
   └─ HybridWalletCore        (UTXO engine, coin selection, encrypted persistence)
-       └─ HybridPSBTContainer (dual signing, raw TX serialization, JSON-RPC broadcast)
+       └─ HybridPSBTContainer (dual signing, BIP-174 binary PSBT, HW wallet merge, raw TX, JSON-RPC)
             └─ BIP341Sighash  (tagged hashes, all SIGHASH types, annex, script-path)
                  ├─ coincurve  (libsecp256k1 — BIP-340 Schnorr)
                  ├─ bech32     (Bech32m P2TR addresses)
@@ -105,7 +107,7 @@ HybridWallet
 | `TaprootKey` | Real secp256k1 private key via `coincurve`. BIP-340 Schnorr sign/verify. Bech32m P2TR address generation. `is_mock` always `False`. |
 | `PQKeyPair` | NIST PQC keypair (ML-DSA or Falcon). Keygen, sign, verify, serialize/deserialize. |
 | `HybridUTXO` | UTXO with dual keys (Taproot + PQ), commitment hash, BIP-65/113 timelock support. |
-| `HybridPSBTContainer` | PSBT-like container with dual signing, BIP-341 sighash, raw TX finalization. |
+| `HybridPSBTContainer` | PSBT container with dual signing, BIP-174 binary serialization (`to_psbt_v0`/`from_psbt_v0`), HW wallet signature merge (`merge_hw_signatures`), raw TX finalization. |
 | `HybridWalletCore` | Address generation, UTXO management, coin selection, balance tracking. |
 | `HybridWallet` | High-level API: receive, fund, send, broadcast, encrypted save/load. |
 | `BIP341Sighash` | Full BIP-341 §4.1 sighash calculator — all hash types, annex, script-path. |
@@ -130,9 +132,9 @@ HybridWallet
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `pq_psbt.py` | ~1150 | Main wallet implementation + self-test demo |
+| `pq_psbt.py` | ~1495 | Main wallet implementation + BIP-174 PSBT serializer + self-test demo |
 | `bitcoin_protocol.py` | ~185 | BIP-341 sighash calculator |
-| `test_pq_psbt.py` | ~1520 | 136 pytest tests across 26 test classes |
+| `test_pq_psbt.py` | ~1775 | 155 pytest tests across 28 test classes |
 
 ---
 
@@ -165,13 +167,16 @@ HybridWallet
 - No soft-fork / hard-fork proposal
 - No miner validation of PQ signatures
 - No mempool policy changes
-- No PSBT binary interop with Bitcoin Core / HWI
+- No full BIP-370 PSBTv2 support (v0 only for now)
 
 ---
 
+## Correct Framing
 
 ✅ *"This system provides real PQ cryptographic enforcement at the wallet and custody layer, without requiring consensus changes."*
 
+❌ ~~"This makes Bitcoin post-quantum secure."~~
+
 ---
 
-*136/136 tests · 26 test classes · Real secp256k1 + Bech32m · Zero mocks · 4 NIST PQC algorithms*
+*155/155 tests · 28 test classes · Real secp256k1 + Bech32m · BIP-174 HW wallet interop · Zero mocks · 4 NIST PQC algorithms*
